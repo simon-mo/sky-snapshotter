@@ -5,15 +5,9 @@ use std::{
 };
 
 use containerd_snapshots as snapshots;
-use containerd_snapshots::{Info};
-
-
-
-
-
+use containerd_snapshots::Info;
 
 use tokio_stream::Stream;
-
 
 pub struct WalkStream {
     pub infos: Vec<Info>,
