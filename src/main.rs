@@ -15,12 +15,11 @@ use log::info;
 use pin_project_lite::pin_project;
 use snapshots::tonic::transport::Server;
 use std::io::{Read, Write};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, ReadBuf};
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::net::UnixListener;
 use tokio::{sync::Mutex, time::Instant};
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_stream::Stream;
-use tokio_stream::StreamExt;
 use tracing::warn;
 
 struct DataStore {
@@ -55,7 +54,7 @@ struct ImageRef {
     blob_url_prefix: String,
 }
 
-fn parse_container_image_url(image_ref: &String) -> ImageRef {
+fn parse_container_image_url(image_ref: &str) -> ImageRef {
     // TODO: handle more cases. This just handle forms like localhost:5000/image:latest case
     // docker tag is far more complex
     let parsed = regex::Regex::new(r"^(?P<host>[^/]+)/(?P<image>[^:]+):(?P<tag>.+)$")
@@ -820,7 +819,7 @@ async fn main() {
     let snapshot_dir = "/tmp/sky-snapshots";
 
     // mkdir snapshot_dir if it doesn't exist
-    if let Err(_) = std::fs::metadata(snapshot_dir) {
+    if std::fs::metadata(snapshot_dir).is_err() {
         std::fs::create_dir(snapshot_dir).expect("Failed to create snapshot dir");
     }
 
