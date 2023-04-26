@@ -281,7 +281,7 @@ impl snapshots::Snapshotter for SkySnapshotter {
                 let mut keys = vec![key.clone()];
 
                 let mut parent = parent;
-                while parent != "" {
+                while !parent.is_empty() {
                     let parent_info = store
                         .info_vec
                         .iter()
@@ -293,30 +293,25 @@ impl snapshots::Snapshotter for SkySnapshotter {
                 info!("Preparing an overlay fs for keys: {:?}", keys);
 
                 let lower_dir_keys = &keys[1..];
-                assert!(lower_dir_keys.len() > 0);
+                assert!(!lower_dir_keys.is_empty());
                 let lower_dirs = lower_dir_keys
                     .iter()
                     .map(|key| {
-                        let sha = store.key_to_sha_map.get(key).expect(
-                            format!(
-                            "can't find the corresponding sha for key={}, this shouldn't happen.",
-                            key
-                        )
-                            .as_str(),
-                        );
+                        let sha = store.key_to_sha_map.get(key).unwrap_or_else(|| panic!("can't find the corresponding sha for key={}, this shouldn't happen.",
+                            key));
                         let dir = format!("{}/{}", self.snapshot_dir, sha);
                         assert!(std::path::Path::new(&dir).is_dir());
-                        return dir;
+                        dir
                     })
                     .collect::<Vec<String>>();
 
                 let overylay_dir =
-                    Path::new("/tmp/sky-snapshots/overlay").join(key.replace("/", "-"));
+                    Path::new("/tmp/sky-snapshots/overlay").join(key.replace('/', "-"));
                 if !overylay_dir.is_dir() {
                     std::fs::create_dir_all(&overylay_dir).unwrap();
                 }
-                let upper_dir = overylay_dir.clone().join("fs");
-                let work_dir = overylay_dir.clone().join("work");
+                let upper_dir = overylay_dir.join("fs");
+                let work_dir = overylay_dir.join("work");
                 std::fs::create_dir(&upper_dir).unwrap();
                 std::fs::create_dir(&work_dir).unwrap();
 
@@ -330,7 +325,7 @@ impl snapshots::Snapshotter for SkySnapshotter {
                 let mount = api::types::Mount {
                     r#type: "overlay".to_string(),
                     source: "overlay".to_string(),
-                    options: options,
+                    options,
                     ..Default::default()
                 };
                 info!(
@@ -343,11 +338,11 @@ impl snapshots::Snapshotter for SkySnapshotter {
 
                 store.info_vec.push(Info {
                     name: key.clone(),
-                    parent: parent.clone(),
+                    parent,
                     kind: Kind::Active,
                     ..Default::default()
                 });
-                store.key_to_mount.insert(key.clone(), mount.clone());
+                store.key_to_mount.insert(key.clone(), mount);
             }
             return Ok(mount_vec);
         }
