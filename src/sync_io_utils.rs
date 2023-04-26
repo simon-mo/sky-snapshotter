@@ -48,6 +48,7 @@ impl<T> BlockingWriter<T>
 where
     T: Write,
 {
+    #[allow(dead_code)]
     fn new(inner_writer: T) -> Self {
         BlockingWriter { inner_writer }
     }
