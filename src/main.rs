@@ -7,20 +7,17 @@ use std::{
     time::SystemTime,
 };
 
-use bytes::Bytes;
 use containerd_snapshots as snapshots;
 use containerd_snapshots::{api, Info, Kind, Usage};
 use futures::TryStreamExt;
 use log::info;
-use pin_project_lite::pin_project;
 use snapshots::tonic::transport::Server;
-use std::io::{Read, Write};
-use tokio::io::{AsyncRead, ReadBuf};
 use tokio::net::UnixListener;
 use tokio::{sync::Mutex, time::Instant};
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_stream::Stream;
 use tracing::warn;
+mod sync_io_utils;
 
 struct DataStore {
     info_vec: Vec<Info>,
@@ -71,233 +68,6 @@ fn parse_container_image_url(image_ref: &str) -> ImageRef {
         tag: tag.to_string(),
         manifest_url,
         blob_url_prefix: format!("http://{}/v2/{}/blobs/", host, image),
-    }
-}
-pin_project! {
-    struct PrefetchReader<T: AsyncRead> {
-        #[pin]
-        inner_reader: T,
-        // buff: ringbuf::HeapRb<u8>,
-        buff_producer: ringbuf::HeapProducer<u8>,
-        buff_consumer: ringbuf::HeapConsumer<u8>,
-    }
-}
-
-impl<T> PrefetchReader<T>
-where
-    T: AsyncRead,
-{
-    fn new(inner_reader: T) -> Self {
-        let buff = ringbuf::HeapRb::<u8>::new(64 * 1024);
-        let (buff_producer, buff_consumer) = buff.split();
-        PrefetchReader {
-            inner_reader,
-            // buff: buff,
-            buff_producer,
-            buff_consumer,
-        }
-    }
-}
-
-impl<T> AsyncRead for PrefetchReader<T>
-where
-    T: AsyncRead,
-{
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        info!("requested readbuf {:?}", buf);
-        let read = self.as_mut().project().inner_reader.poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = read {
-            info!("after poll readbuf {:?}", buf);
-        }
-        read
-        // match read {
-        //     Poll::Ready(Ok(n)) => {
-        //         // self.as_mut().project().buff_producer.push_slice(&buf[..n]);
-        //         Poll::Ready(Ok(n))
-        //     }
-        //     Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-        //     Poll::Pending => {
-        //         Poll::Pending
-        //         // let mut buff_consumer = self.as_mut().project().buff_consumer;
-        //         // let n = buff_consumer.pop_slice(buf);
-        //         // if n == 0 {
-        //         //     Poll::Pending
-        //         // } else {
-        //         //     Poll::Ready(Ok(n))
-        //         // }
-        //     }
-        // }
-
-        // let n = futures::ready!(reader.as_mut().poll_read(cx, buf))?;
-        // self.buf.extend_from_slice(&buf[..n]);
-        // Poll::Ready(Ok(n))
-
-        // let n = futures::ready!(reader.as_mut().poll_read(cx, buf))?;
-
-        // start
-    }
-}
-
-pin_project! {
-    struct WrapperStream<T>
-    where
-        T: Stream<Item = reqwest::Result<Bytes>>,
-    {
-        #[pin]
-        inner_stream: T,
-    }
-}
-
-impl<T> WrapperStream<T>
-where
-    T: Stream<Item = reqwest::Result<Bytes>>,
-{
-    fn new(inner_stream: T) -> Self {
-        WrapperStream { inner_stream }
-    }
-}
-
-impl<T> Stream for WrapperStream<T>
-where
-    T: Stream<Item = reqwest::Result<Bytes>>,
-{
-    type Item = reqwest::Result<Bytes>;
-
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<reqwest::Result<Bytes>>> {
-        let mut bytes_pulled = Vec::<u8>::with_capacity(516096);
-        let mut inner_stream = self.project().inner_stream;
-
-        loop {
-            match inner_stream.as_mut().poll_next(cx) {
-                Poll::Ready(Some(Ok(bytes))) => {
-                    bytes_pulled.extend_from_slice(&bytes);
-                    // if bytes_pulled.len() > 10 {
-                    //     info!("pulled {} bytes", bytes_pulled.len());
-                    //     return Poll::Ready(Some(Ok(bytes_pulled.freeze())));
-                    // }
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    // TODO: we should figure what to do with the existing bytes_pulled buffer
-                    assert!(bytes_pulled.is_empty());
-                    return Poll::Ready(Some(Err(e)));
-                }
-                Poll::Ready(None) => {
-                    if bytes_pulled.is_empty() {
-                        return Poll::Ready(None);
-                    } else {
-                        // info!("Poll::Ready(None) pulled {} bytes", bytes_pulled.len());
-                        return Poll::Ready(Some(Ok(bytes_pulled.into())));
-                    }
-                }
-                Poll::Pending => {
-                    if bytes_pulled.is_empty() {
-                        return Poll::Pending;
-                    } else {
-                        // info!("Poll::Pending pulled {} bytes", bytes_pulled.len());
-                        return Poll::Ready(Some(Ok(bytes_pulled.into())));
-                    }
-                }
-            }
-        }
-    }
-}
-
-struct BlockingReader<T>
-where
-    T: Read,
-{
-    inner_reader: T,
-}
-
-impl<T> BlockingReader<T>
-where
-    T: Read,
-{
-    fn new(inner_reader: T) -> Self {
-        BlockingReader { inner_reader }
-    }
-}
-impl<T> Read for BlockingReader<T>
-where
-    T: Read,
-{
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        loop {
-            match self.inner_reader.read(buf) {
-                Ok(n) => return Ok(n),
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        // spin here.
-                        std::thread::yield_now();
-                        continue;
-                    } else {
-                        return Err(e);
-                    }
-                }
-            };
-        }
-    }
-}
-
-struct BlockingWriter<T>
-where
-    T: Write,
-{
-    inner_writer: T,
-}
-
-impl<T> BlockingWriter<T>
-where
-    T: Write,
-{
-    fn new(inner_writer: T) -> Self {
-        BlockingWriter { inner_writer }
-    }
-}
-
-impl<T> Write for BlockingWriter<T>
-where
-    T: Write,
-{
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        loop {
-            match self.inner_writer.write(buf) {
-                Ok(n) => return Ok(n),
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        // spin here.
-                        std::thread::yield_now();
-                        continue;
-                    } else {
-                        return Err(e);
-                    }
-                }
-            };
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        loop {
-            match self.inner_writer.flush() {
-                Ok(n) => return Ok(n),
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        // spin here.
-                        std::thread::yield_now();
-                        continue;
-                    } else {
-                        return Err(e);
-                    }
-                }
-            };
-        }
     }
 }
 
@@ -405,7 +175,8 @@ impl SkySnapshotter {
                 // });
                 let untar_thread = tokio::task::spawn_blocking(move || {
                     let read_decoded_sync = read_decoded.as_mut_base();
-                    let mut archive = tar::Archive::new(BlockingReader::new(read_decoded_sync));
+                    let mut archive =
+                        tar::Archive::new(sync_io_utils::BlockingReader::new(read_decoded_sync));
                     let s = Instant::now();
                     archive.unpack(path).unwrap();
                     info!(
@@ -432,165 +203,11 @@ impl SkySnapshotter {
                 }
                 untar_thread.await.unwrap();
 
-                // let raw_buff = ringbuf::HeapRb::<u8>::new(64 * 1024);
-                // let (mut write_raw, mut read_raw) = raw_buff.split();
-                // let decoded_buff = ringbuf::HeapRb::<u8>::new(64 * 1024);
-                // let (mut write_decoded, mut read_decoded) = decoded_buff.split();
-
-                // let decompression_thread = tokio::task::spawn_blocking(move || {
-                //     let reader = BlockingReader::new(&mut read_raw);
-                //     let mut writer = BlockingWriter::new(&mut write_decoded);
-                //     let mut gzip_reader = flate2::read::GzDecoder::new(reader);
-                //     std::io::copy(&mut gzip_reader, &mut writer).unwrap();
-                // });
-                // let untar_thread = tokio::task::spawn_blocking(move || {
-                //     let reader = BlockingReader::new(&mut read_decoded);
-                //     let mut tar = tar::Archive::new(reader);
-                //     tar.unpack(path).unwrap();
-                // });
-
-                // let mut byte_stream = tokio_util::io::StreamReader::new(
-                //     resp.bytes_stream()
-                //         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
-                // );
-
-                // loop {
-                //     let mut buffer = [0; 8192];
-                //     let bytes_read = byte_stream.read(&mut buffer).await.unwrap();
-                //     let free_len = write_raw.free_len();
-                //     if bytes_read == 0 {
-                //         // EOF
-                //         break;
-                //     } else if bytes_read <= free_len {
-                //         write_raw.push_slice(&buffer[0..bytes_read]);
-                //     } else {
-                //         write_raw.push_slice(&buffer[0..free_len]);
-
-                //         let rest = &buffer[free_len..bytes_read];
-                //         loop {
-                //             // basically busy spin
-                //             tokio::task::yield_now().await;
-                //             if rest.len() <= write_raw.free_len() {
-                //                 write_raw.push_slice(rest);
-                //                 break;
-                //             }
-                //         }
-                //     }
-                // }
-
-                // drop(write_raw);
-                // decompression_thread.await.unwrap();
-                // untar_thread.await.unwrap();
-
-                // Async version
-                // let bytes_stream = resp.bytes_stream().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)).into_async_read();
-                // let buf_reader = futures::io::BufReader::new(bytes_stream);
-
-                // let mut bytes_stream = resp.bytes_stream();
-
-                // let mut buffer = Vec::new();
-                // {
-                //     let writer = futures::io::BufWriter::new(&mut buffer);
-                //     let mut gzip_decoder =
-                //         async_compression::futures::write::GzipDecoder::new(writer);
-
-                //     while let Some(bytes) = bytes_stream.next().await {
-                //         let bytes = bytes.unwrap();
-                //         gzip_decoder.write(&bytes).await.unwrap();
-                //     }
-                //     gzip_decoder.finish().await.unwrap();
-                // }
-
-                // // let gzip_reader = async_compression::futures::bufread::GzipDecoder::new(buf_reader);
-                // let reader = futures::io::BufReader::new(buffer.as_slice());
-                // async_tar::Archive::new(reader).unpack(path).await.unwrap();
-
-                // Sync version
-                // let bytes_arr = resp.bytes().await.unwrap();
-                // let gzip_reader = flate2::read::GzDecoder::new(bytes_arr.as_ref());
-                // tar::Archive::new(gzip_reader)
-                //     .unpack(path)
-                //     .unwrap();
-
-                // Mixed version
-                // let bytes_arr = resp.bytes().await.unwrap();
-                // let bytes_stream = resp.bytes_stream();
-                // .into_async_read();
-                // let wrapper_stream = PrefetchReader::new(bytes_stream);
-                // let wrapper_stream = WrapperStream::new(bytes_stream)
-                //     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-                //     .into_async_read();
-                // let wrapper_stream = tokio_util::io::StreamReader::new(
-                //     WrapperStream::new(bytes_stream)
-                //         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
-                // );
-
-                // let chunk = resp.bytes_stream().next().await.unwrap().unwrap().len();
-                // info!("{} chunk size", chunk);
-                // 1 / 0;
-                // let done_fetch = Instant::now();
-
-                // let mut gzip_reader = async_compression::tokio::bufread::GzipDecoder::new(
-                // futures::io::BufReader::new(bytes_arr.as_ref()),
-                // tokio::io::BufReader::with_capacity(bytes_arr.len() / 10, bytes_arr.as_ref()),
-                // bytes_stream,
-                // buff_read,
-                // tokio::io::BufReader::with_capacity(64 * 1024, wrapper_stream),
-                // );
-
-                // let mut buf = vec![0; total_bytes.try_into().unwrap()];
-                // gzip_reader.read_to_end(&mut buf).await.unwrap();
-                // info!(
-                //     "{} bytes before, {} bytes after decompression",
-                //     total_bytes,
-                //     buf.len()
-                // );
-
-                // let prefetch_reader = PrefetchReader::new(gzip_reader);
-                // let buffer_reader = tokio::io::BufReader::with_capacity(1_000_000_000, gzip_reader);
-
-                // let done_unzip = Instant::now();
-
-                // let mut decoded_reader = flate2::bufread::GzDecoder::new(bytes_arr.as_ref());
-                // let mut buf = vec![0; total_bytes.try_into().unwrap()];
-                // decoded_reader.read_to_end(&mut buf).unwrap();
-                // tokio_tar::Archive::new(buf.as_slice())
-                // tokio_tar::Archive::new(gzip_reader)
-                // tokio_tar::Archive::new(prefetch_reader)
-                // tokio_tar::Archive::new(buffer_reader)
-                //     .unpack(path)
-                //     .await
-                //     .unwrap();
-                // let done_untar = Instant::now();
-
-                // let mut archive = tokio_tar::Archive::new(buf.as_slice());
-                // let mut entries = archive.entries().unwrap();
-                // let mut join_set = tokio::task::JoinSet::new();
-                // while let Some(file) = entries.next().await {
-                //     let path = path.clone();
-                //     join_set.spawn(async move { file.unwrap().unpack_in(path).await.unwrap() });
-                // }
-                // while let Some(res) = join_set.join_next().await {
-                //     res.unwrap();
-                // }
-
-                // let download_duration = done_fetch.duration_since(start_time);
-                // let unzip_duration = done_unzip.duration_since(done_fetch);
-                // let untar_duration = done_untar.duration_since(done_unzip);
                 let total_duration = Instant::now().duration_since(start_time);
                 info!(
                     "{}, {} bytes, fetched in {:?}",
                     url, total_bytes, total_duration
                 );
-                // info!(
-                //     "{}, {} bytes, fetched in {:?}, untar: {:?}, unzip: {:?}, download: {:?}",
-                //     url,
-                //     total_bytes,
-                //     total_duration,
-                //     untar_duration,
-                //     unzip_duration,
-                //     download_duration
-                // );
 
                 url
             });
