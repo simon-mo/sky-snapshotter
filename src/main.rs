@@ -386,55 +386,111 @@ impl SkySnapshotter {
                 let resp: reqwest::Response = client.get(&url).send().await.unwrap();
                 let total_bytes = resp.content_length().unwrap();
 
-                let raw_buff = ringbuf::HeapRb::<u8>::new(64 * 1024);
-                let (mut write_raw, mut read_raw) = raw_buff.split();
-                let decoded_buff = ringbuf::HeapRb::<u8>::new(64 * 1024);
-                let (mut write_decoded, mut read_decoded) = decoded_buff.split();
+                let raw_to_decode_buff = async_ringbuf::AsyncHeapRb::<u8>::new(64 * 1024 * 1024);
+                let (mut write_raw, read_raw) = raw_to_decode_buff.split();
+                let decode_to_untar_buff = async_ringbuf::AsyncHeapRb::<u8>::new(64 * 1024 * 1024);
+                let (mut write_decoded, mut read_decoded) = decode_to_untar_buff.split();
 
-                let decompression_thread = tokio::task::spawn_blocking(move || {
-                    let reader = BlockingReader::new(&mut read_raw);
-                    let mut writer = BlockingWriter::new(&mut write_decoded);
-                    let mut gzip_reader = flate2::read::GzDecoder::new(reader);
-                    std::io::copy(&mut gzip_reader, &mut writer).unwrap();
+                let mut work_set = tokio::task::JoinSet::new();
+                work_set.spawn(async move {
+                    let bufreader = tokio::io::BufReader::with_capacity(64 * 1024, read_raw);
+                    let mut reader = async_compression::tokio::bufread::GzipDecoder::new(bufreader);
+                    let s = Instant::now();
+                    tokio::io::copy(&mut reader, &mut write_decoded)
+                        .await
+                        .unwrap();
+                    info!(
+                        "Decompressed in {}ms",
+                        Instant::now().duration_since(s).as_millis()
+                    );
                 });
+                // work_set.spawn(async move {
+                //     let tar = async_tar::Archive::new(read_decoded);
+                //     let s = Instant::now();
+                //     tar.unpack(path).await.unwrap();
+                //     info!(
+                //         "Unpacked in {}ms",
+                //         Instant::now().duration_since(s).as_millis()
+                //     );
+                // });
                 let untar_thread = tokio::task::spawn_blocking(move || {
-                    let reader = BlockingReader::new(&mut read_decoded);
-                    let mut tar = tar::Archive::new(reader);
-                    tar.unpack(path).unwrap();
+                    let read_decoded_sync = read_decoded.as_mut_base();
+                    let mut archive = tar::Archive::new(BlockingReader::new(read_decoded_sync));
+                    let s = Instant::now();
+                    archive.unpack(path).unwrap();
+                    info!(
+                        "Unpacked in {}ms",
+                        Instant::now().duration_since(s).as_millis()
+                    );
                 });
 
-                let mut byte_stream = tokio_util::io::StreamReader::new(
+                let mut output_from_socket = tokio_util::io::StreamReader::new(
                     resp.bytes_stream()
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
                 );
+                let s = Instant::now();
+                tokio::io::copy_buf(&mut output_from_socket, &mut write_raw)
+                    .await
+                    .unwrap();
+                info!(
+                    "Downloaded in {}ms",
+                    Instant::now().duration_since(s).as_millis()
+                );
 
-                loop {
-                    let mut buffer = [0; 8192];
-                    let bytes_read = byte_stream.read(&mut buffer).await.unwrap();
-                    let free_len = write_raw.free_len();
-                    if bytes_read == 0 {
-                        // EOF
-                        break;
-                    } else if bytes_read <= free_len {
-                        write_raw.push_slice(&buffer[0..bytes_read]);
-                    } else {
-                        write_raw.push_slice(&buffer[0..free_len]);
-
-                        let rest = &buffer[free_len..bytes_read];
-                        loop {
-                            // basically busy spin
-                            tokio::task::yield_now().await;
-                            if rest.len() <= write_raw.free_len() {
-                                write_raw.push_slice(rest);
-                                break;
-                            }
-                        }
-                    }
+                while let Some(res) = work_set.join_next().await {
+                    res.unwrap();
                 }
-
-                drop(write_raw);
-                decompression_thread.await.unwrap();
                 untar_thread.await.unwrap();
+
+                // let raw_buff = ringbuf::HeapRb::<u8>::new(64 * 1024);
+                // let (mut write_raw, mut read_raw) = raw_buff.split();
+                // let decoded_buff = ringbuf::HeapRb::<u8>::new(64 * 1024);
+                // let (mut write_decoded, mut read_decoded) = decoded_buff.split();
+
+                // let decompression_thread = tokio::task::spawn_blocking(move || {
+                //     let reader = BlockingReader::new(&mut read_raw);
+                //     let mut writer = BlockingWriter::new(&mut write_decoded);
+                //     let mut gzip_reader = flate2::read::GzDecoder::new(reader);
+                //     std::io::copy(&mut gzip_reader, &mut writer).unwrap();
+                // });
+                // let untar_thread = tokio::task::spawn_blocking(move || {
+                //     let reader = BlockingReader::new(&mut read_decoded);
+                //     let mut tar = tar::Archive::new(reader);
+                //     tar.unpack(path).unwrap();
+                // });
+
+                // let mut byte_stream = tokio_util::io::StreamReader::new(
+                //     resp.bytes_stream()
+                //         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
+                // );
+
+                // loop {
+                //     let mut buffer = [0; 8192];
+                //     let bytes_read = byte_stream.read(&mut buffer).await.unwrap();
+                //     let free_len = write_raw.free_len();
+                //     if bytes_read == 0 {
+                //         // EOF
+                //         break;
+                //     } else if bytes_read <= free_len {
+                //         write_raw.push_slice(&buffer[0..bytes_read]);
+                //     } else {
+                //         write_raw.push_slice(&buffer[0..free_len]);
+
+                //         let rest = &buffer[free_len..bytes_read];
+                //         loop {
+                //             // basically busy spin
+                //             tokio::task::yield_now().await;
+                //             if rest.len() <= write_raw.free_len() {
+                //                 write_raw.push_slice(rest);
+                //                 break;
+                //             }
+                //         }
+                //     }
+                // }
+
+                // drop(write_raw);
+                // decompression_thread.await.unwrap();
+                // untar_thread.await.unwrap();
 
                 // Async version
                 // let bytes_stream = resp.bytes_stream().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)).into_async_read();
