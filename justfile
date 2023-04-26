@@ -1,6 +1,15 @@
 list:
     just --list
 
+reset-containerd:
+    sudo rm -rf /var/lib/containerd/io.containerd.metadata.v1.bolt
+    sudo rm -rf /run/containerd/io.containerd.runtime.v2.task/default
+    sudo systemctl restart containerd
+    sudo systemctl status containerd
+
+reset-sky:
+    rm -rf /tmp/sky-snapshots
+
 restart-containerd:
     sudo systemctl restart containerd
 
@@ -33,7 +42,7 @@ pull-image:
     sudo ctr-remote image rm localhost:5000/image:latest
     sleep 1
     sudo ctr-remote image rpull -snapshotter=sky -use-containerd-labels localhost:5000/image:latest
-    # sudo ctr-remote run -snapshotter=sky localhost:5000/image:latest ls
+    sudo ctr-remote run -snapshotter=sky localhost:5000/image:latest running-image-id ls -lh
 
     # sudo crictl --runtime-endpoint=unix:///run/containerd/containerd.sock rmi localhost:5000/image:latest || true
     # sudo crictl --debug --runtime-endpoint=unix:///run/containerd/containerd.sock pull --annotation=io.containerd.cri.runtime-handler=sky localhost:5000/image:latest

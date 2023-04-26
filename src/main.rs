@@ -1,7 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
+    path::Path,
     sync::Arc,
     time::SystemTime,
+    vec,
 };
 
 use containerd_snapshots as snapshots;
@@ -20,6 +22,8 @@ mod sync_io_utils;
 
 struct DataStore {
     info_vec: Vec<Info>,
+    key_to_sha_map: HashMap<String, String>,
+    key_to_mount: HashMap<String, api::types::Mount>,
     sha_fetched: HashSet<String>,
     // TODO: implement this for perisstent store
     _db_conn: tokio_rusqlite::Connection,
@@ -29,6 +33,8 @@ impl DataStore {
     async fn new(db_path: &str) -> Self {
         DataStore {
             info_vec: Vec::new(),
+            key_to_sha_map: HashMap::new(),
+            key_to_mount: HashMap::new(),
             sha_fetched: HashSet::new(),
             _db_conn: tokio_rusqlite::Connection::open(db_path).await.unwrap(),
         }
@@ -119,10 +125,11 @@ impl SkySnapshotter {
         for (url, path) in url_to_path {
             let client = client_arc.clone();
             let url_clone = url.clone();
+            let sha = path.replace("/tmp/sky-snapshots/", "");
 
             {
-                if self.data_store.lock().await.sha_fetched.contains(&url) {
-                    info!("{} already fetched, skipping", url);
+                if self.data_store.lock().await.sha_fetched.contains(&sha) {
+                    info!("{} already fetched, skipping", sha);
                     continue;
                 }
             }
@@ -181,47 +188,19 @@ impl SkySnapshotter {
                     total_bytes as f64 / 1e6
                 );
 
-                url
+                sha
             });
         }
 
         while let Some(res) = tasks.join_next().await {
-            let url = res.unwrap();
-            self.data_store.lock().await.sha_fetched.insert(url);
+            let sha = res.unwrap();
+            self.data_store.lock().await.sha_fetched.insert(sha);
         }
     }
 }
 
-fn clone_info_hack(info: &Info) -> Info {
-    // a hack because the Info doesn't have copy trait
-    serde_json::from_str(&serde_json::to_string(info).unwrap()).unwrap()
-}
-
-#[snapshots::tonic::async_trait]
-impl snapshots::Snapshotter for SkySnapshotter {
-    type Error = snapshots::tonic::Status;
-
-    async fn prepare(
-        &self,
-        key: String,
-        parent: String,
-        labels: HashMap<String, String>,
-    ) -> Result<Vec<api::types::Mount>, Self::Error> {
-        info!("Prepare: key={}, parent={}", key, parent,);
-
-        {
-            self.data_store.lock().await.info_vec.push(Info {
-                kind: Kind::Committed,
-                name: key,
-                parent,
-                labels: labels.clone(),
-                created_at: SystemTime::now(),
-                updated_at: SystemTime::now(),
-            });
-        }
-
-        let image_ref = labels.get("containerd.io/snapshot/cri.image-ref").unwrap();
-
+impl SkySnapshotter {
+    async fn prefetch_image(&self, image_ref: &String) {
         let image_ref_struct = parse_container_image_url(image_ref);
         let manifest = self
             .fetch_image_manifest(&image_ref_struct.manifest_url)
@@ -262,9 +241,149 @@ impl snapshots::Snapshotter for SkySnapshotter {
         }
         let blobs_url_to_path = blobs_url_to_layers
             .iter()
-            .map(|(url, digest)| (url.clone(), format!("{}/{}", self.snapshot_dir, digest)))
+            .map(|(url, digest)| {
+                (
+                    url.clone(),
+                    format!("{}/{}", self.snapshot_dir, digest.replace("sha256:", "")),
+                )
+            })
             .collect::<HashMap<String, String>>();
         self.parallel_fetch_to_file(blobs_url_to_path).await;
+    }
+}
+
+fn clone_info_hack(info: &Info) -> Info {
+    // a hack because the Info doesn't have copy trait
+    serde_json::from_str(&serde_json::to_string(info).unwrap()).unwrap()
+}
+
+#[snapshots::tonic::async_trait]
+impl snapshots::Snapshotter for SkySnapshotter {
+    type Error = snapshots::tonic::Status;
+
+    async fn prepare(
+        &self,
+        key: String,
+        parent: String,
+        labels: HashMap<String, String>,
+    ) -> Result<Vec<api::types::Mount>, Self::Error> {
+        info!("Prepare: key={}, parent={}", key, parent);
+        // info!(
+        //     "Prepare: key={}, parent={}, label={:?}",
+        //     key, parent, labels
+        // );
+
+        if !labels.contains_key("containerd.io/snapshot.ref") {
+            // We are actually preparing a working container, not a snapshot.
+            let mut mount_vec = Vec::new();
+            {
+                let mut store = self.data_store.lock().await;
+                let mut keys = vec![key.clone()];
+
+                let mut parent = parent;
+                while parent != "" {
+                    let parent_info = store
+                        .info_vec
+                        .iter()
+                        .find(|info| info.name == parent)
+                        .unwrap();
+                    keys.push(parent_info.name.clone());
+                    parent = parent_info.parent.clone();
+                }
+                info!("Preparing an overlay fs for keys: {:?}", keys);
+
+                let lower_dir_keys = &keys[1..];
+                assert!(lower_dir_keys.len() > 0);
+                let lower_dirs = lower_dir_keys
+                    .iter()
+                    .map(|key| {
+                        let sha = store.key_to_sha_map.get(key).expect(
+                            format!(
+                            "can't find the corresponding sha for key={}, this shouldn't happen.",
+                            key
+                        )
+                            .as_str(),
+                        );
+                        let dir = format!("{}/{}", self.snapshot_dir, sha);
+                        assert!(std::path::Path::new(&dir).is_dir());
+                        return dir;
+                    })
+                    .collect::<Vec<String>>();
+
+                let overylay_dir =
+                    Path::new("/tmp/sky-snapshots/overlay").join(key.replace("/", "-"));
+                if !overylay_dir.is_dir() {
+                    std::fs::create_dir_all(&overylay_dir).unwrap();
+                }
+                let upper_dir = overylay_dir.clone().join("fs");
+                let work_dir = overylay_dir.clone().join("work");
+                std::fs::create_dir(&upper_dir).unwrap();
+                std::fs::create_dir(&work_dir).unwrap();
+
+                let mut options: Vec<String> = vec![];
+                options.push("index=off".to_string());
+                options.push("userxattr".to_string());
+                options.push(format!("upperdir={}", upper_dir.to_str().unwrap()));
+                options.push(format!("workdir={}", work_dir.to_str().unwrap()));
+                options.push(format!("lowerdir={}", lower_dirs.join(":")));
+
+                let mount = api::types::Mount {
+                    r#type: "overlay".to_string(),
+                    source: "overlay".to_string(),
+                    options: options,
+                    ..Default::default()
+                };
+                info!(
+                    "Sending mount array: `mount -t {} {} -o{}`",
+                    mount.r#type,
+                    mount.source,
+                    mount.options.join(","),
+                );
+                mount_vec.push(mount.clone());
+
+                store.info_vec.push(Info {
+                    name: key.clone(),
+                    parent: parent.clone(),
+                    kind: Kind::Active,
+                    ..Default::default()
+                });
+                store.key_to_mount.insert(key.clone(), mount.clone());
+            }
+            return Ok(mount_vec);
+        }
+
+        let image_ref = labels.get("containerd.io/snapshot/cri.image-ref").unwrap();
+        let layer_ref = labels
+            .get("containerd.io/snapshot/cri.layer-digest")
+            .unwrap()
+            .replace("sha256:", "");
+
+        let mut layer_exists = false;
+        {
+            let store = self.data_store.lock().await;
+            if store.sha_fetched.contains(layer_ref.as_str()) {
+                info!("{} already fetched, skipping", layer_ref);
+                layer_exists = true;
+            }
+        }
+
+        if !layer_exists {
+            self.prefetch_image(image_ref).await;
+        }
+
+        {
+            let mut store = self.data_store.lock().await;
+            assert!(store.sha_fetched.contains(layer_ref.as_str()));
+            store.key_to_sha_map.insert(key.clone(), layer_ref.clone());
+            store.info_vec.push(Info {
+                kind: Kind::Committed,
+                name: key.clone(),
+                parent,
+                labels: labels.clone(),
+                created_at: SystemTime::now(),
+                updated_at: SystemTime::now(),
+            });
+        }
 
         Err(snapshots::tonic::Status::already_exists("already exists"))
     }
@@ -317,7 +436,16 @@ impl snapshots::Snapshotter for SkySnapshotter {
 
     async fn mounts(&self, key: String) -> Result<Vec<api::types::Mount>, Self::Error> {
         info!("Mounts: {}", key);
-        Ok(Vec::new())
+        {
+            let store = self.data_store.lock().await;
+            if let Some(mount) = store.key_to_mount.get(&key) {
+                return Ok(vec![mount.clone()]);
+            } else {
+                return Err(snapshots::tonic::Status::not_found(
+                    "Not found from skysnaphotter",
+                ));
+            }
+        }
     }
 
     async fn view(
