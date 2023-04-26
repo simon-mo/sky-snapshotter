@@ -1,9 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    ops::DerefMut,
-    pin::Pin,
     sync::Arc,
-    task::{Context, Poll},
     time::SystemTime,
 };
 
@@ -15,8 +12,8 @@ use snapshots::tonic::transport::Server;
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::UnixListenerStream;
-use tokio_stream::Stream;
-use tracing::{info, info_span, warn, Instrument};
+
+use tracing::{info, warn};
 
 mod list_request_stream;
 mod sync_io_utils;
@@ -45,15 +42,12 @@ struct SkySnapshotter {
 }
 
 #[derive(Debug)]
-struct ImageRef {
-    host: String,
-    image: String,
-    tag: String,
+struct ImageRegistryUrls {
     manifest_url: String,
     blob_url_prefix: String,
 }
 
-fn parse_container_image_url(image_ref: &str) -> ImageRef {
+fn parse_container_image_url(image_ref: &str) -> ImageRegistryUrls {
     // TODO: handle more cases. This just handle forms like localhost:5000/image:latest case
     // docker tag is far more complex
     let parsed = regex::Regex::new(r"^(?P<host>[^/]+)/(?P<image>[^:]+):(?P<tag>.+)$")
@@ -64,10 +58,7 @@ fn parse_container_image_url(image_ref: &str) -> ImageRef {
     let image = parsed.name("image").unwrap().as_str();
     let tag = parsed.name("tag").unwrap().as_str();
     let manifest_url = format!("http://{}/v2/{}/manifests/{}", host, image, tag);
-    ImageRef {
-        host: host.to_string(),
-        image: image.to_string(),
-        tag: tag.to_string(),
+    ImageRegistryUrls {
         manifest_url,
         blob_url_prefix: format!("http://{}/v2/{}/blobs/", host, image),
     }
