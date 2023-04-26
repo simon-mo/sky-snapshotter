@@ -200,7 +200,7 @@ impl SkySnapshotter {
 }
 
 impl SkySnapshotter {
-    async fn prefetch_image(&self, image_ref: &String) {
+    async fn prefetch_image(&self, image_ref: &str) {
         let image_ref_struct = parse_container_image_url(image_ref);
         let manifest = self
             .fetch_image_manifest(&image_ref_struct.manifest_url)
