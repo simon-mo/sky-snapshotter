@@ -8,7 +8,7 @@ log-containerd:
     sudo systemctl status containerd
 
 run:
-    cargo run
+    cargo run --release
 
 run-registry:
     # docker run -d -p 5000:5000 --name registry registry:2
@@ -30,6 +30,7 @@ pull-image:
     sudo ctr-remote image rm localhost:5000/image:latest
     sleep 1
     sudo ctr-remote image rpull -snapshotter=sky -use-containerd-labels localhost:5000/image:latest
+    # sudo ctr-remote run -snapshotter=sky localhost:5000/image:latest ls
 
     # sudo crictl --runtime-endpoint=unix:///run/containerd/containerd.sock rmi localhost:5000/image:latest || true
     # sudo crictl --debug --runtime-endpoint=unix:///run/containerd/containerd.sock pull --annotation=io.containerd.cri.runtime-handler=sky localhost:5000/image:latest
