@@ -10,13 +10,15 @@ use std::{
 use containerd_snapshots as snapshots;
 use containerd_snapshots::{api, Info, Kind, Usage};
 use futures::TryStreamExt;
-use log::info;
+use oci_spec::image::{Descriptor, ImageManifest};
 use snapshots::tonic::transport::Server;
 use tokio::net::UnixListener;
-use tokio::{sync::Mutex, time::Instant};
+use tokio::sync::Mutex;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_stream::Stream;
-use tracing::warn;
+use tracing::{info, info_span, warn, Instrument};
+
+mod list_request_stream;
 mod sync_io_utils;
 
 struct DataStore {
@@ -80,7 +82,7 @@ impl SkySnapshotter {
         }
     }
 
-    async fn fetch_image_manifest(&self, manifest_url: &String) -> json::JsonValue {
+    async fn fetch_image_manifest(&self, manifest_url: &String) -> ImageManifest {
         let manifest_text = self
             .client
             .get(manifest_url)
@@ -95,7 +97,7 @@ impl SkySnapshotter {
             .await
             .expect("Failed to parse manifest");
 
-        json::parse(&manifest_text).unwrap()
+        ImageManifest::from_reader(manifest_text.as_bytes()).unwrap()
     }
 
     async fn parallel_head(
@@ -125,6 +127,7 @@ impl SkySnapshotter {
         let client_arc = Arc::new(self.client.clone());
         for (url, path) in url_to_path {
             let client = client_arc.clone();
+            let url_clone = url.clone();
 
             {
                 if self.data_store.lock().await.sha_fetched.contains(&url) {
@@ -141,11 +144,12 @@ impl SkySnapshotter {
                     std::fs::remove_dir_all(dir_path).unwrap();
                 }
 
-                // Use tokio tracing for more robust timing
-                let start_time = Instant::now();
-                let resp: reqwest::Response = client.get(&url).send().await.unwrap();
-                let total_bytes = resp.content_length().unwrap();
+                let start = minstant::Instant::now();
 
+                let resp: reqwest::Response = client.get(&url).send().await.unwrap();
+
+                // TODO: use total_bytes to help infer buffer size to manage the relative buffer size and download throughput.
+                let total_bytes = resp.content_length().unwrap();
                 let raw_to_decode_buff = async_ringbuf::AsyncHeapRb::<u8>::new(64 * 1024 * 1024);
                 let (mut write_raw, read_raw) = raw_to_decode_buff.split();
                 let decode_to_untar_buff = async_ringbuf::AsyncHeapRb::<u8>::new(64 * 1024 * 1024);
@@ -155,58 +159,35 @@ impl SkySnapshotter {
                 work_set.spawn(async move {
                     let bufreader = tokio::io::BufReader::with_capacity(64 * 1024, read_raw);
                     let mut reader = async_compression::tokio::bufread::GzipDecoder::new(bufreader);
-                    let s = Instant::now();
                     tokio::io::copy(&mut reader, &mut write_decoded)
                         .await
                         .unwrap();
-                    info!(
-                        "Decompressed in {}ms",
-                        Instant::now().duration_since(s).as_millis()
-                    );
                 });
-                // work_set.spawn(async move {
-                //     let tar = async_tar::Archive::new(read_decoded);
-                //     let s = Instant::now();
-                //     tar.unpack(path).await.unwrap();
-                //     info!(
-                //         "Unpacked in {}ms",
-                //         Instant::now().duration_since(s).as_millis()
-                //     );
-                // });
                 let untar_thread = tokio::task::spawn_blocking(move || {
                     let read_decoded_sync = read_decoded.as_mut_base();
                     let mut archive =
                         tar::Archive::new(sync_io_utils::BlockingReader::new(read_decoded_sync));
-                    let s = Instant::now();
                     archive.unpack(path).unwrap();
-                    info!(
-                        "Unpacked in {}ms",
-                        Instant::now().duration_since(s).as_millis()
-                    );
                 });
 
                 let mut output_from_socket = tokio_util::io::StreamReader::new(
                     resp.bytes_stream()
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
                 );
-                let s = Instant::now();
                 tokio::io::copy_buf(&mut output_from_socket, &mut write_raw)
                     .await
                     .unwrap();
-                info!(
-                    "Downloaded in {}ms",
-                    Instant::now().duration_since(s).as_millis()
-                );
 
                 while let Some(res) = work_set.join_next().await {
                     res.unwrap();
                 }
                 untar_thread.await.unwrap();
 
-                let total_duration = Instant::now().duration_since(start_time);
                 info!(
-                    "{}, {} bytes, fetched in {:?}",
-                    url, total_bytes, total_duration
+                    "Fetched {} in {}ms, {:.2}mb",
+                    url_clone,
+                    start.elapsed().as_millis(),
+                    total_bytes as f64 / 1e6
                 );
 
                 url
@@ -220,13 +201,6 @@ impl SkySnapshotter {
     }
 }
 
-#[derive(Debug)]
-struct OCILayer {
-    media_type: String,
-    digest: String,
-    size: u64,
-}
-
 fn clone_info_hack(info: &Info) -> Info {
     // a hack because the Info doesn't have copy trait
     serde_json::from_str(&serde_json::to_string(info).unwrap()).unwrap()
@@ -235,6 +209,92 @@ fn clone_info_hack(info: &Info) -> Info {
 #[snapshots::tonic::async_trait]
 impl snapshots::Snapshotter for SkySnapshotter {
     type Error = snapshots::tonic::Status;
+
+    async fn prepare(
+        &self,
+        key: String,
+        parent: String,
+        labels: HashMap<String, String>,
+    ) -> Result<Vec<api::types::Mount>, Self::Error> {
+        info!("Prepare: key={}, parent={}", key, parent,);
+
+        {
+            self.data_store.lock().await.info_vec.push(Info {
+                kind: Kind::Committed,
+                name: key,
+                parent,
+                labels: labels.clone(),
+                created_at: SystemTime::now(),
+                updated_at: SystemTime::now(),
+            });
+        }
+
+        let image_ref = labels.get("containerd.io/snapshot/cri.image-ref").unwrap();
+
+        let image_ref_struct = parse_container_image_url(image_ref);
+        let manifest = self
+            .fetch_image_manifest(&image_ref_struct.manifest_url)
+            .await;
+        let layers = manifest
+            .layers()
+            .iter()
+            .map(|layer| (layer.digest().to_string(), layer))
+            .collect::<HashMap<String, &Descriptor>>();
+        let blobs_url_to_layers = layers
+            .keys()
+            .map(|digest| {
+                (
+                    format!("{}{}", image_ref_struct.blob_url_prefix, digest),
+                    digest.clone(),
+                )
+            })
+            .collect::<HashMap<String, String>>();
+        let headers = self
+            .parallel_head(blobs_url_to_layers.keys().cloned().collect::<Vec<String>>())
+            .await;
+        for (url, header) in headers {
+            let spec = layers.get(blobs_url_to_layers.get(&url).unwrap()).unwrap();
+            assert!(
+                spec.media_type().to_string()
+                    == "application/vnd.docker.image.rootfs.diff.tar.gzip"
+            );
+            assert!(
+                spec.size()
+                    == header
+                        .get("content-length")
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .parse::<i64>()
+                        .unwrap()
+            );
+        }
+        let blobs_url_to_path = blobs_url_to_layers
+            .iter()
+            .map(|(url, digest)| (url.clone(), format!("{}/{}", self.snapshot_dir, digest)))
+            .collect::<HashMap<String, String>>();
+        self.parallel_fetch_to_file(blobs_url_to_path).await;
+
+        Err(snapshots::tonic::Status::already_exists("already exists"))
+    }
+
+    type InfoStream = list_request_stream::WalkStream;
+    async fn list(&self) -> Result<Self::InfoStream, Self::Error> {
+        info!("List: ");
+        let mut stream = list_request_stream::WalkStream::new();
+        {
+            stream.infos.extend(
+                self.data_store
+                    .lock()
+                    .await
+                    .info_vec
+                    .iter()
+                    .map(clone_info_hack),
+            );
+        }
+
+        Ok(stream)
+    }
 
     async fn stat(&self, key: String) -> Result<Info, Self::Error> {
         info!("Stat: {}", key);
@@ -269,93 +329,6 @@ impl snapshots::Snapshotter for SkySnapshotter {
         Ok(Vec::new())
     }
 
-    async fn prepare(
-        &self,
-        key: String,
-        parent: String,
-        labels: HashMap<String, String>,
-    ) -> Result<Vec<api::types::Mount>, Self::Error> {
-        info!(
-            "Prepare: key={}, parent={}, labels={:?}",
-            key, parent, labels
-        );
-
-        {
-            self.data_store.lock().await.info_vec.push(Info {
-                kind: Kind::Committed,
-                name: key,
-                parent,
-                labels: labels.clone(),
-                created_at: SystemTime::now(),
-                updated_at: SystemTime::now(),
-            });
-        }
-
-        let image_ref = labels.get("containerd.io/snapshot/cri.image-ref").unwrap();
-
-        // {
-        //     let image_layers = labels
-        //         .get("containerd.io/snapshot/cri.image-layers")
-        //         .unwrap().split(",").collect::<Vec<&str>>();
-        //     let layer_digest = labels
-        //         .get("containerd.io/snapshot/cri.layer-digest")
-        //         .unwrap();
-        // }
-
-        let image_ref_struct = parse_container_image_url(image_ref);
-        let manifest = self
-            .fetch_image_manifest(&image_ref_struct.manifest_url)
-            .await;
-        let layers = manifest["layers"]
-            .members()
-            .map(|layer| {
-                (
-                    layer["digest"].to_string(),
-                    OCILayer {
-                        media_type: layer["mediaType"].to_string(),
-                        digest: layer["digest"].to_string(),
-                        size: layer["size"].as_u64().unwrap(),
-                    },
-                )
-            })
-            .collect::<HashMap<String, OCILayer>>();
-        let blobs_url_to_layers = layers
-            .keys()
-            .map(|digest| {
-                (
-                    format!("{}{}", image_ref_struct.blob_url_prefix, digest),
-                    digest.clone(),
-                )
-            })
-            .collect::<HashMap<String, String>>();
-        let headers = self
-            .parallel_head(blobs_url_to_layers.keys().cloned().collect::<Vec<String>>())
-            .await;
-        for (url, header) in headers {
-            let spec = layers.get(blobs_url_to_layers.get(&url).unwrap()).unwrap();
-            assert!(spec.media_type == "application/vnd.docker.image.rootfs.diff.tar.gzip");
-            assert!(
-                spec.size
-                    == header
-                        .get("content-length")
-                        .unwrap()
-                        .to_str()
-                        .unwrap()
-                        .parse::<u64>()
-                        .unwrap()
-            );
-        }
-        let blobs_url_to_path = blobs_url_to_layers
-            .iter()
-            .map(|(url, digest)| (url.clone(), format!("{}/{}", self.snapshot_dir, digest)))
-            .collect::<HashMap<String, String>>();
-        self.parallel_fetch_to_file(blobs_url_to_path).await;
-
-        info!("");
-
-        Err(snapshots::tonic::Status::already_exists("already exists"))
-    }
-
     async fn view(
         &self,
         key: String,
@@ -379,45 +352,6 @@ impl snapshots::Snapshotter for SkySnapshotter {
     async fn remove(&self, key: String) -> Result<(), Self::Error> {
         info!("Remove: {}", key);
         Ok(())
-    }
-
-    type InfoStream = WalkStream;
-    async fn list(&self) -> Result<Self::InfoStream, Self::Error> {
-        info!("List: ");
-        let mut stream = WalkStream::new();
-        {
-            stream.infos.extend(
-                self.data_store
-                    .lock()
-                    .await
-                    .info_vec
-                    .iter()
-                    .map(clone_info_hack),
-            );
-        }
-
-        Ok(stream)
-    }
-}
-
-struct WalkStream {
-    infos: Vec<Info>,
-}
-impl WalkStream {
-    fn new() -> Self {
-        WalkStream { infos: Vec::new() }
-    }
-}
-
-impl Stream for WalkStream {
-    type Item = Result<Info, snapshots::tonic::Status>;
-    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // Poll::Ready(None)
-        let next: Option<Info> = self.deref_mut().infos.pop();
-        match next {
-            Some(info) => Poll::Ready(Some(Ok(info))),
-            None => Poll::Ready(None),
-        }
     }
 }
 
