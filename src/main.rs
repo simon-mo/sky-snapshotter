@@ -1,15 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
     ops::DerefMut,
-    os::fd::{FromRawFd, IntoRawFd},
     pin::Pin,
-    rc::Rc,
     sync::Arc,
     task::{Context, Poll},
     time::SystemTime,
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use containerd_snapshots as snapshots;
 use containerd_snapshots::{api, Info, Kind, Usage};
 use futures::TryStreamExt;
@@ -68,13 +66,13 @@ fn parse_container_image_url(image_ref: &String) -> ImageRef {
     let image = parsed.name("image").unwrap().as_str();
     let tag = parsed.name("tag").unwrap().as_str();
     let manifest_url = format!("http://{}/v2/{}/manifests/{}", host, image, tag);
-    return ImageRef {
+    ImageRef {
         host: host.to_string(),
         image: image.to_string(),
         tag: tag.to_string(),
-        manifest_url: manifest_url,
+        manifest_url,
         blob_url_prefix: format!("http://{}/v2/{}/blobs/", host, image),
-    };
+    }
 }
 pin_project! {
     struct PrefetchReader<T: AsyncRead> {
@@ -92,12 +90,12 @@ where
 {
     fn new(inner_reader: T) -> Self {
         let buff = ringbuf::HeapRb::<u8>::new(64 * 1024);
-        let (mut buff_producer, mut buff_consumer) = buff.split();
+        let (buff_producer, buff_consumer) = buff.split();
         PrefetchReader {
-            inner_reader: inner_reader,
+            inner_reader,
             // buff: buff,
-            buff_producer: buff_producer,
-            buff_consumer: buff_consumer,
+            buff_producer,
+            buff_consumer,
         }
     }
 }
@@ -116,7 +114,7 @@ where
         if let Poll::Ready(Ok(())) = read {
             info!("after poll readbuf {:?}", buf);
         }
-        return read;
+        read
         // match read {
         //     Poll::Ready(Ok(n)) => {
         //         // self.as_mut().project().buff_producer.push_slice(&buf[..n]);
@@ -160,9 +158,7 @@ where
     T: Stream<Item = reqwest::Result<Bytes>>,
 {
     fn new(inner_stream: T) -> Self {
-        WrapperStream {
-            inner_stream: inner_stream,
-        }
+        WrapperStream { inner_stream }
     }
 }
 
@@ -226,9 +222,7 @@ where
     T: Read,
 {
     fn new(inner_reader: T) -> Self {
-        BlockingReader {
-            inner_reader: inner_reader,
-        }
+        BlockingReader { inner_reader }
     }
 }
 impl<T> Read for BlockingReader<T>
@@ -265,9 +259,7 @@ where
     T: Write,
 {
     fn new(inner_writer: T) -> Self {
-        BlockingWriter {
-            inner_writer: inner_writer,
-        }
+        BlockingWriter { inner_writer }
     }
 }
 
@@ -333,9 +325,8 @@ impl SkySnapshotter {
             .text()
             .await
             .expect("Failed to parse manifest");
-        let parsed_json = json::parse(&manifest_text).unwrap();
 
-        parsed_json
+        json::parse(&manifest_text).unwrap()
     }
 
     async fn parallel_head(
@@ -360,7 +351,7 @@ impl SkySnapshotter {
         responses
     }
 
-    async fn parallel_fetch_to_file(&self, url_to_path: HashMap<String, String>) -> () {
+    async fn parallel_fetch_to_file(&self, url_to_path: HashMap<String, String>) {
         let mut tasks = tokio::task::JoinSet::new();
         let client_arc = Arc::new(self.client.clone());
         for (url, path) in url_to_path {
@@ -602,7 +593,7 @@ impl SkySnapshotter {
                 //     download_duration
                 // );
 
-                return url;
+                url
             });
         }
 
@@ -622,7 +613,7 @@ struct OCILayer {
 
 fn clone_info_hack(info: &Info) -> Info {
     // a hack because the Info doesn't have copy trait
-    return serde_json::from_str(&serde_json::to_string(info).unwrap()).unwrap();
+    serde_json::from_str(&serde_json::to_string(info).unwrap()).unwrap()
 }
 
 #[snapshots::tonic::async_trait]
@@ -637,7 +628,7 @@ impl snapshots::Snapshotter for SkySnapshotter {
             .info_vec
             .iter()
             .find(|info| info.name == key)
-            .map(|info| clone_info_hack(info))
+            .map(clone_info_hack)
             .ok_or(snapshots::tonic::Status::not_found(
                 "Not found from skysnaphotter",
             ))
@@ -677,7 +668,7 @@ impl snapshots::Snapshotter for SkySnapshotter {
             self.data_store.lock().await.info_vec.push(Info {
                 kind: Kind::Committed,
                 name: key,
-                parent: parent,
+                parent,
                 labels: labels.clone(),
                 created_at: SystemTime::now(),
                 updated_at: SystemTime::now(),
@@ -695,7 +686,7 @@ impl snapshots::Snapshotter for SkySnapshotter {
         //         .unwrap();
         // }
 
-        let image_ref_struct = parse_container_image_url(&image_ref);
+        let image_ref_struct = parse_container_image_url(image_ref);
         let manifest = self
             .fetch_image_manifest(&image_ref_struct.manifest_url)
             .await;
@@ -713,8 +704,8 @@ impl snapshots::Snapshotter for SkySnapshotter {
             })
             .collect::<HashMap<String, OCILayer>>();
         let blobs_url_to_layers = layers
-            .iter()
-            .map(|(digest, _)| {
+            .keys()
+            .map(|digest| {
                 (
                     format!("{}{}", image_ref_struct.blob_url_prefix, digest),
                     digest.clone(),
@@ -722,13 +713,7 @@ impl snapshots::Snapshotter for SkySnapshotter {
             })
             .collect::<HashMap<String, String>>();
         let headers = self
-            .parallel_head(
-                blobs_url_to_layers
-                    .keys()
-                    .into_iter()
-                    .cloned()
-                    .collect::<Vec<String>>(),
-            )
+            .parallel_head(blobs_url_to_layers.keys().cloned().collect::<Vec<String>>())
             .await;
         for (url, header) in headers {
             let spec = layers.get(blobs_url_to_layers.get(&url).unwrap()).unwrap();
@@ -791,7 +776,7 @@ impl snapshots::Snapshotter for SkySnapshotter {
                     .await
                     .info_vec
                     .iter()
-                    .map(|info| clone_info_hack(info)),
+                    .map(clone_info_hack),
             );
         }
 
@@ -814,12 +799,8 @@ impl Stream for WalkStream {
         // Poll::Ready(None)
         let next: Option<Info> = self.deref_mut().infos.pop();
         match next {
-            Some(info) => {
-                return Poll::Ready(Some(Ok(info)));
-            }
-            None => {
-                return Poll::Ready(None);
-            }
+            Some(info) => Poll::Ready(Some(Ok(info))),
+            None => Poll::Ready(None),
         }
     }
 }
@@ -844,7 +825,7 @@ async fn main() {
     }
 
     // remove socket_path if it exists
-    if let Ok(_) = std::fs::metadata(socket_path) {
+    if std::fs::metadata(socket_path).is_ok() {
         std::fs::remove_file(socket_path).expect("Failed to remove socket");
     }
 
