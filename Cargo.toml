@@ -6,7 +6,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-containerd-snapshots = "0.2.0"
+# containerd-snapshots = "0.2.0"
+containerd-snapshots = {path = "../../rust-extensions/crates/snapshots"}
 tokio = { version = "1.27.0", features = ["full"] }
 simple_logger = { version  = "4.0", default-features = false }
 futures = "0.3"
@@ -24,7 +25,7 @@ http = "0.2.9"
 tokio-rusqlite = "0.4.0"
 async-tar = "0.4.2"
 tokio-tar = "0.3.0"
-async-compression = { version = "0.3.15", features = ["futures-io", "tokio", "gzip"] }
+async-compression = { version = "0.3.15", features = ["futures-io", "tokio", "gzip", "zstd"] }
 tar = "0.4.38"
 flate2 = "1.0"
 tokio-util = { version = "0.7.7", features = ["io"]}
@@ -37,3 +38,6 @@ unix-named-pipe = "0.2.0"
 async-ringbuf = { version = "0.1.3", features = ["impl-tokio"] }
 oci-spec = "0.6.0"
 minstant = "0.1.2"
+indicatif = "0.17.4"
+serde = { version = "1.0.163", features = ["derive"] }
+vmm-sys-util = "0.11.1"

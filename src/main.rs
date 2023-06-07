@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    fmt::Debug,
     path::Path,
     sync::Arc,
     time::SystemTime,
@@ -15,10 +16,30 @@ use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::UnixListenerStream;
 
-use tracing::{info, warn};
+use tracing::info;
 
 mod list_request_stream;
 mod sync_io_utils;
+
+use serde::{Deserialize, Serialize};
+use std::fs::OpenOptions;
+use std::io::prelude::*;
+use std::io::Read;
+use std::io::SeekFrom;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct SplitMetadata {
+    path: String,
+    start_offset: u32,
+    chunk_size: u32,
+    total_size: u64,
+}
+
+fn ensure_parent_dir_exists(path: &std::path::PathBuf) {
+    let mut dir_path = path.clone();
+    dir_path.pop();
+    std::fs::create_dir_all(&dir_path).unwrap();
+}
 
 struct DataStore {
     info_vec: Vec<Info>,
@@ -45,6 +66,9 @@ struct SkySnapshotter {
     client: reqwest::Client,
     data_store: Arc<Mutex<DataStore>>,
     snapshot_dir: String,
+    // multi_pbar: Arc<indicatif::MultiProgress>,
+    // sty: indicatif::ProgressStyle,
+    fallocate_lock: Arc<std::sync::Mutex<()>>,
 }
 
 #[derive(Debug)]
@@ -76,6 +100,11 @@ impl SkySnapshotter {
             client: reqwest::Client::new(),
             data_store: Arc::new(Mutex::new(DataStore::new(db_path).await)),
             snapshot_dir: snapshot_dir.to_string(),
+            // multi_pbar: Arc::new(indicatif::MultiProgress::new()),
+            // sty: (indicatif::ProgressStyle::with_template("{spinner:.green} ({msg}) [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes:>12}/{total_bytes:>12} ({bytes_per_sec:>15}, {eta:>5})")
+            // .unwrap()
+            // .progress_chars("#>-")),
+            fallocate_lock: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -83,16 +112,15 @@ impl SkySnapshotter {
         let manifest_text = self
             .client
             .get(manifest_url)
-            .header(
-                "Accept",
-                "application/vnd.docker.distribution.manifest.v2+json",
-            )
+            .header("Accept", "application/vnd.oci.image.manifest.v1+json")
             .send()
             .await
             .expect("Failed to fetch image manifest")
             .text()
             .await
             .expect("Failed to parse manifest");
+
+        // info!("Fetched manifest: {} from {}", manifest_text, manifest_url);
 
         ImageManifest::from_reader(manifest_text.as_bytes()).unwrap()
     }
@@ -125,7 +153,13 @@ impl SkySnapshotter {
         for (url, path) in url_to_path {
             let client = client_arc.clone();
             let url_clone = url.clone();
-            let sha = path.replace("/tmp/sky-snapshots/", "");
+            let sha = url
+                .split("/")
+                .last()
+                .unwrap()
+                .to_string()
+                .replace("sha256:", "");
+            let fallocate_lock = self.fallocate_lock.clone();
 
             {
                 if self.data_store.lock().await.sha_fetched.contains(&sha) {
@@ -134,20 +168,33 @@ impl SkySnapshotter {
                 }
             }
 
+            // let m = self.multi_pbar.clone();
+            // let sty = self.sty.clone();
+
             tasks.spawn(async move {
                 // remove `path` if the direcotry exists
-                let dir_path = std::path::Path::new(&path);
-                if dir_path.exists() {
-                    warn!("{} exists, removing", dir_path.display());
-                    std::fs::remove_dir_all(dir_path).unwrap();
-                }
+                // safe to comment out beacuse we are starting with empty dir anyway.
+                // let dir_path = std::path::Path::new(&path);
+                // if dir_path.exists() {
+                //     warn!("{} exists, removing", dir_path.display());
+                //     std::fs::remove_dir_all(dir_path).unwrap();
+                // }
+
+                // create a directory for this sha regardless.
+                let p = format!("/tmp/sky-snapshots/{}", sha.clone());
+                let real_path = std::path::Path::new(p.as_str());
+                std::fs::create_dir_all(real_path).unwrap();
 
                 let start = minstant::Instant::now();
 
                 let resp: reqwest::Response = client.get(&url).send().await.unwrap();
+                let total_bytes = resp.content_length().unwrap();
+
+                // let pbar = m.add(indicatif::ProgressBar::new(total_bytes));
+                // pbar.set_style(sty);
+                // pbar.set_message(url_clone.clone()[&url_clone.len() - 20..].to_owned());
 
                 // TODO: use total_bytes to help infer buffer size to manage the relative buffer size and download throughput.
-                let total_bytes = resp.content_length().unwrap();
                 let raw_to_decode_buff = async_ringbuf::AsyncHeapRb::<u8>::new(64 * 1024 * 1024);
                 let (mut write_raw, read_raw) = raw_to_decode_buff.split();
                 let decode_to_untar_buff = async_ringbuf::AsyncHeapRb::<u8>::new(64 * 1024 * 1024);
@@ -156,16 +203,168 @@ impl SkySnapshotter {
                 let mut work_set = tokio::task::JoinSet::new();
                 work_set.spawn(async move {
                     let bufreader = tokio::io::BufReader::with_capacity(64 * 1024, read_raw);
-                    let mut reader = async_compression::tokio::bufread::GzipDecoder::new(bufreader);
+                    let mut reader = async_compression::tokio::bufread::ZstdDecoder::new(bufreader);
                     tokio::io::copy(&mut reader, &mut write_decoded)
                         .await
                         .unwrap();
                 });
                 let untar_thread = tokio::task::spawn_blocking(move || {
                     let read_decoded_sync = read_decoded.as_mut_base();
-                    let mut archive =
+                    let mut tar =
                         tar::Archive::new(sync_io_utils::BlockingReader::new(read_decoded_sync));
-                    archive.unpack(path).unwrap();
+                    // archive.unpack(path).unwrap();
+
+                    // This has some lifetime issue... fix it later
+                    // let decoder = Box::new(sync_io_utils::BlockingReader::new(read_decoded_sync));
+                    // crate::tar_unpack::unpack_one_tar(decoder, path.clone(), fallocate_lock);
+
+                    // let mut tar = tar::Archive::new(decoder);
+                    let unpack_to = path.clone();
+                    // mkdir
+                    std::fs::create_dir_all(&unpack_to).unwrap();
+
+                    let mut maybe_split_metadata: Option<SplitMetadata> = None;
+                    for entry in tar.entries().unwrap() {
+                        let mut entry = entry.expect(format!("Failed to read entry from tar {:?}", &url).as_str());
+                        let path = entry.path().unwrap().display().to_string();
+
+                        match entry.header().entry_type() {
+                            tar::EntryType::Directory => {
+                                // info!("Creating directory {}", &path);
+                                let path = Path::new(&unpack_to).join(path.clone());
+                                std::fs::create_dir_all(&path).unwrap();
+                                continue;
+                            }
+                            tar::EntryType::Symlink => {
+                                let target_path = entry.link_name().unwrap().unwrap().display().to_string();
+                                let path = Path::new(&unpack_to).join(path.clone());
+
+                                // symlink should point to an "abosolute" path as seen in the layer.
+                                // this we are writing the target_path "as is".
+
+                                // let target_path = Path::new(&unpack_to).join(target_path);
+                                // info!("Creating symlink {:?} -> {:?}", &path, &target_path);
+                                std::os::unix::fs::symlink(&target_path, &path).unwrap();
+                                continue;
+                            }
+                            tar::EntryType::Link => {
+                                let target_path = entry.link_name().unwrap().unwrap().display().to_string();
+                                let path: std::path::PathBuf = Path::new(&unpack_to).join(path.clone());
+                                let target_path = Path::new(&unpack_to).join(target_path);
+                                // the target_path should already exist in the same archive.
+                                assert!(target_path.is_file(), "{:?}", target_path.display());
+                                // info!("Creating hard link {:?} -> {:?}", &path, &target_path);
+                                std::fs::hard_link(&target_path, &path).unwrap();
+                                continue;
+                            }
+                            _ => {}
+                        }
+
+                        if path.contains("split-metadata") {
+                            // load the data
+                            let mut buf = String::new();
+                            entry.read_to_string(&mut buf).unwrap();
+                            let split_metadata: SplitMetadata = serde_json::from_str(&buf).unwrap();
+
+                            assert!(maybe_split_metadata.is_none());
+                            maybe_split_metadata = Some(split_metadata.clone());
+
+                            let path = Path::new(&unpack_to).join(split_metadata.path);
+                            ensure_parent_dir_exists(&path);
+
+                            {
+                                let _lock = fallocate_lock.lock().unwrap();
+                                if !path.is_file() {
+                                    let f = OpenOptions::new()
+                                        .read(true)
+                                        .write(true)
+                                        .create(true)
+                                        .open(&path)
+                                        .unwrap();
+                                    vmm_sys_util::fallocate::fallocate(
+                                        &f,
+                                        vmm_sys_util::fallocate::FallocateMode::ZeroRange,
+                                        false,
+                                        0,
+                                        split_metadata.total_size as u64,
+                                    )
+                                    .unwrap();
+                                    info!("Fallocated file {:?}", &path);
+                                } else {
+                                    let current_size = std::fs::metadata(&path).unwrap().len();
+                                    info!(
+                                        "File {:?} (size {}) already exists, skip falllocate",
+                                        &path, current_size
+                                    );
+                                }
+                            }
+
+                            continue;
+                        }
+
+                        // info!("Handling regular file {:?}", &path);
+
+                        let path = Path::new(&unpack_to).join(path);
+                        // create directory
+                        ensure_parent_dir_exists(&path);
+                        // create and write the file
+                        match maybe_split_metadata {
+                            Some(metadata) => {
+                                assert!(path.is_file());
+                                let mut file = OpenOptions::new()
+                                    .read(true)
+                                    .write(true)
+                                    .open(&path)
+                                    .unwrap();
+                                let offset = file
+                                    .seek(SeekFrom::Start(metadata.start_offset as u64))
+                                    .unwrap();
+                                let num_bytes_written = std::io::copy(&mut entry, &mut file).unwrap();
+                                let finished_offset = file.seek(SeekFrom::Current(0)).unwrap();
+                                info!(
+                                    "Writing {:?} (size {}) to {:?} (offset {}, physical_offset {}), {} written, finished_offset {}",
+                                    &path,
+                                    &entry.header().size().unwrap(),
+                                    &path,
+                                    &metadata.start_offset,
+                                    &offset,
+                                    &num_bytes_written,
+                                    &finished_offset,
+                                );
+                                maybe_split_metadata = None;
+                            }
+                            None => {
+                                assert!(entry.header().entry_type().is_file(), "entry {:?} is not a file, in {}", &path, &url);
+                                // entry.unpack(&unpack_to).unwrap();
+                                // entry.unpack_in(&path).unwrap();
+
+                                let full_path = Path::new(&unpack_to.clone()).join(path);
+                                let file_parent_dir = full_path.parent().unwrap();
+                                std::fs::create_dir_all(&file_parent_dir).unwrap();
+
+
+                                // TODO: set the actual mode
+                                use std::os::unix::fs::OpenOptionsExt;
+                                let mut file = std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .write(true)
+                                    .mode(777)
+                                    .open(&full_path)
+                                    .unwrap();
+                                // info!(
+                                //     "Writing {:?} (size {}) to {:?}",
+                                //     &path,
+                                //     &entry.header().size().unwrap(),
+                                //     &path
+                                // );
+                                std::io::copy(&mut entry, &mut file).unwrap();
+                            }
+                        };
+                    }
+
+
+
+
                 });
 
                 let mut output_from_socket = tokio_util::io::StreamReader::new(
@@ -182,9 +381,9 @@ impl SkySnapshotter {
                 untar_thread.await.unwrap();
 
                 info!(
-                    "Fetched {} in {}ms, {:.2}mb",
+                    "Fetched {} in {:.3}s, {:.2}mb",
                     url_clone,
-                    start.elapsed().as_millis(),
+                    start.elapsed().as_millis() as f64 / 1e3,
                     total_bytes as f64 / 1e6
                 );
 
@@ -196,6 +395,14 @@ impl SkySnapshotter {
             let sha = res.unwrap();
             self.data_store.lock().await.sha_fetched.insert(sha);
         }
+    }
+}
+
+impl Debug for SkySnapshotter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SkySnapshotter")
+            .field("snapshot_dir", &self.snapshot_dir)
+            .finish()
     }
 }
 
@@ -224,22 +431,23 @@ impl SkySnapshotter {
             .await;
         for (url, header) in headers {
             let spec = layers.get(blobs_url_to_layers.get(&url).unwrap()).unwrap();
+            assert!(spec.media_type().to_string() == "application/vnd.oci.image.layer.v1.tar+zstd");
+            let content_length = header
+                .get("content-length")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .parse::<i64>()
+                .unwrap();
             assert!(
-                spec.media_type().to_string()
-                    == "application/vnd.docker.image.rootfs.diff.tar.gzip"
-            );
-            assert!(
-                spec.size()
-                    == header
-                        .get("content-length")
-                        .unwrap()
-                        .to_str()
-                        .unwrap()
-                        .parse::<i64>()
-                        .unwrap()
+                spec.size() == content_length,
+                "size mismatch for {}: spec {}, header {}",
+                url,
+                spec.size(),
+                content_length
             );
         }
-        let blobs_url_to_path = blobs_url_to_layers
+        let mut blobs_url_to_path = blobs_url_to_layers
             .iter()
             .map(|(url, digest)| {
                 (
@@ -248,6 +456,38 @@ impl SkySnapshotter {
                 )
             })
             .collect::<HashMap<String, String>>();
+
+        for (digest, layer_descriptor) in layers {
+            let url = format!("{}{}", image_ref_struct.blob_url_prefix, digest);
+
+            if let Some(annotation) = layer_descriptor.annotations() {
+                let shard_idx = annotation
+                    .get("org.skycontainers.layer_shard_index")
+                    .unwrap()
+                    .parse::<u32>()
+                    .unwrap();
+                let shard_count = annotation
+                    .get("org.skycontainers.layer_shard_total")
+                    .unwrap()
+                    .parse::<u32>()
+                    .unwrap();
+
+                let parent_sha = annotation
+                    .get("org.skycontainers.layer_shard_parent_sha")
+                    .map(|s| s.to_string());
+
+                if shard_count > 1 && shard_idx != 0 {
+                    let parent_sha = parent_sha.unwrap();
+                    let parent_url = format!("{}{}", image_ref_struct.blob_url_prefix, parent_sha);
+                    let parent_path = blobs_url_to_path.get(&parent_url).unwrap().clone();
+                    blobs_url_to_path
+                        .insert(url, parent_path)
+                        .expect("we should be overwriting something here.");
+                    info!("{} is a shard, parent is {}, updating its downloading directly to parent dir", digest, parent_sha);
+                }
+            }
+        }
+
         self.parallel_fetch_to_file(blobs_url_to_path).await;
     }
 }
@@ -261,6 +501,7 @@ fn clone_info_hack(info: &Info) -> Info {
 impl snapshots::Snapshotter for SkySnapshotter {
     type Error = snapshots::tonic::Status;
 
+    #[tracing::instrument(level = "info", skip(self, labels))]
     async fn prepare(
         &self,
         key: String,
@@ -275,6 +516,12 @@ impl snapshots::Snapshotter for SkySnapshotter {
 
         if !labels.contains_key("containerd.io/snapshot.ref") {
             // We are actually preparing a working container, not a snapshot.
+
+            info!(
+                "Preparing a working container, not a snapshot. key={}, parent={}",
+                key, parent
+            );
+
             let mut mount_vec = Vec::new();
             {
                 let mut store = self.data_store.lock().await;
@@ -294,7 +541,7 @@ impl snapshots::Snapshotter for SkySnapshotter {
 
                 let lower_dir_keys = &keys[1..];
                 assert!(!lower_dir_keys.is_empty());
-                let lower_dirs = lower_dir_keys
+                let mut lower_dirs = lower_dir_keys
                     .iter()
                     .map(|key| {
                         let sha = store.key_to_sha_map.get(key).unwrap_or_else(|| panic!("can't find the corresponding sha for key={}, this shouldn't happen.",
@@ -302,8 +549,11 @@ impl snapshots::Snapshotter for SkySnapshotter {
                         let dir = format!("{}/{}", self.snapshot_dir, sha);
                         assert!(std::path::Path::new(&dir).is_dir());
                         dir
-                    })
+                    }).filter(
+                        |dir| std::path::Path::new(dir).is_dir() && std::fs::read_dir(dir).unwrap().count() > 0
+                    )
                     .collect::<Vec<String>>();
+                lower_dirs.reverse();
 
                 let overylay_dir =
                     Path::new("/tmp/sky-snapshots/overlay").join(key.replace('/', "-"));
@@ -384,8 +634,12 @@ impl snapshots::Snapshotter for SkySnapshotter {
     }
 
     type InfoStream = list_request_stream::WalkStream;
-    async fn list(&self) -> Result<Self::InfoStream, Self::Error> {
-        info!("List: ");
+    #[tracing::instrument(level = "info")]
+    async fn list(
+        &self,
+        snapshotter: String,
+        filters: Vec<String>,
+    ) -> Result<Self::InfoStream, Self::Error> {
         let mut stream = list_request_stream::WalkStream::new();
         {
             stream.infos.extend(
@@ -394,16 +648,46 @@ impl snapshots::Snapshotter for SkySnapshotter {
                     .await
                     .info_vec
                     .iter()
+                    .filter(|info| {
+                        for filters_ in filters.clone() {
+                            for filter in filters_.as_str().split(",") {
+                                let [key, value] = filter.split("==").collect::<Vec<&str>>()[..] else {
+                                    panic!("Invalid filter {}", filter);
+                                };
+                                if key == "parent" {
+                                    if info.parent != value {
+                                        return false;
+                                    }
+                                } else if key.starts_with("labels") {
+                                    let label_key = key.replace("labels.", "").replace('"', "");
+                                    if info.labels.get(&label_key) != Some(&value.to_string()) {
+                                        return false;
+                                    }
+                                } else {
+                                    panic!("Unknown filter {}", key);
+                                }
+                                return true;
+                            }
+                        }
+                        true
+                    })
                     .map(clone_info_hack),
             );
         }
+        info!(
+            "List: filters {:?}, returning {} entries",
+            &filters,
+            stream.infos.len()
+        );
 
         Ok(stream)
     }
 
+    #[tracing::instrument(level = "info")]
     async fn stat(&self, key: String) -> Result<Info, Self::Error> {
-        info!("Stat: {}", key);
-        self.data_store
+        let start = minstant::Instant::now();
+        let resp = self
+            .data_store
             .lock()
             .await
             .info_vec
@@ -412,7 +696,9 @@ impl snapshots::Snapshotter for SkySnapshotter {
             .map(clone_info_hack)
             .ok_or(snapshots::tonic::Status::not_found(
                 "Not found from skysnaphotter",
-            ))
+            ));
+        info!("Stat: {}, duration: {:?}", key, start.elapsed());
+        resp
     }
 
     async fn update(
@@ -420,15 +706,18 @@ impl snapshots::Snapshotter for SkySnapshotter {
         info: Info,
         fieldpaths: Option<Vec<String>>,
     ) -> Result<Info, Self::Error> {
-        info!("Update: info={:?}, fieldpaths={:?}", info, fieldpaths);
-        Ok(Info::default())
+        todo!();
+        // info!("Update: info={:?}, fieldpaths={:?}", info, fieldpaths);
+        // Ok(Info::default())
     }
 
     async fn usage(&self, key: String) -> Result<Usage, Self::Error> {
-        info!("Usage: {}", key);
-        Ok(Usage::default())
+        todo!();
+        // info!("Usage: {}", key);
+        // Ok(Usage::default())
     }
 
+    #[tracing::instrument(level = "info")]
     async fn mounts(&self, key: String) -> Result<Vec<api::types::Mount>, Self::Error> {
         info!("Mounts: {}", key);
         {
@@ -449,8 +738,9 @@ impl snapshots::Snapshotter for SkySnapshotter {
         parent: String,
         labels: HashMap<String, String>,
     ) -> Result<Vec<api::types::Mount>, Self::Error> {
-        info!("View: key={}, parent={}, labels={:?}", key, parent, labels);
-        Ok(Vec::new())
+        todo!();
+        // info!("View: key={}, parent={}, labels={:?}", key, parent, labels);
+        // Ok(Vec::new())
     }
 
     async fn commit(
@@ -459,13 +749,15 @@ impl snapshots::Snapshotter for SkySnapshotter {
         key: String,
         labels: HashMap<String, String>,
     ) -> Result<(), Self::Error> {
-        info!("Commit: name={}, key={}, labels={:?}", name, key, labels);
-        Ok(())
+        todo!();
+        // info!("Commit: name={}, key={}, labels={:?}", name, key, labels);
+        // Ok(())
     }
 
     async fn remove(&self, key: String) -> Result<(), Self::Error> {
-        info!("Remove: {}", key);
-        Ok(())
+        todo!();
+        // info!("Remove: {}", key);
+        // Ok(())
     }
 }
 
